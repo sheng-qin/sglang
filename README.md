@@ -1,3 +1,49 @@
+# SGLang on Iluvatar (CoreX)
+
+本仓库在上游 SGLang 基础上适配了 **天数智芯 Iluvatar（ivcore11 / CoreX）** 平台，推理后端切换到 **ixformer** 算子库。首个打通目标为 **Qwen3-30B-A3B**（bf16，PP4），prefill / decode 输出已验证正确。
+
+## 适配重点
+
+- **Attention 后端**：新增 `ixformer` attention backend（`--attention-backend ixformer`），复用 `FlashAttentionBackend`，`kernel_provider="ixformer"`。
+- **KV cache 布局**：ixformer 模式下采用 paged **HND** 布局 `(num_pages, head_num, page_size, head_dim)`；`page_size` 强制为 **16**（cuInfer paged-attention kernel 仅支持 `block_size=16`）。
+- **Attention 计算**：
+  - prefill 用 `flash_attn_varlen_func`（raw k/v）；
+  - decode 用 ixformer 原生 paged attention `flash_attn_with_kvcache`（cuInfer）；
+  - KV 写入用 `reshape_and_cache_flash`。
+- **关键算子替换**：RMSNorm、SiLU/GeLU-and-mul、Linear、MoE top-k softmax 切到 ixformer；RoPE / QK-Norm 在 ixformer 下走 PyTorch native（fused QK-Norm-RoPE 与 fused KV-write 关闭，由 attention 负责写 cache —— 否则 decode 会读到空 KV）。
+- **MoE**：当前为 per-expert 的 torch 正确性实现；融合版 ixformer group-GEMM MoE 为后续性能优化项。
+- **依赖与构建**：`torch` / `triton` / `flashinfer` / `sgl-kernel` 等使用平台私有版，`python/pyproject.toml` 注释掉对应 CUDA 依赖；`sgl_kernel` 通过 shim 转发到 `ixformer.contrib.sgl_kernel`；CUDA C++ JIT 类 kernel（如 `clamp_position`、`fused_inplace_qknorm`）在 ixformer 下走 native 回退。
+- **CUDA graph**：bring-up 阶段默认关闭（`--disable-cuda-graph`）。
+
+## 后续 TODO
+
+- **去掉 `python/sgl_kernel/` shim（路径 A）**：当前用顶层 `sgl_kernel` shim 转发到 `ixformer.contrib.sgl_kernel`，以减小对上游源码的改动。理想方案是由平台侧提供顶层 `sgl_kernel`（ixformer 直接 alias `ixformer.contrib.sgl_kernel` 为 `sgl_kernel`，或发布 CoreX 版 `sgl_kernel` wheel），届时 `import sgl_kernel` 原生可用，本目录即可删除。
+- **MoE 性能**：将 per-expert torch 实现替换为融合的 ixformer group-GEMM MoE。
+- **CUDA graph**：bring-up 稳定后尝试开启以提升 decode 吞吐。
+
+## Iluvatar 平台编译与安装
+
+> 前置：已安装平台私有版 `torch`、`triton`、`ixformer`。
+
+```bash
+# 1. 构建 wheel（默认跳过 Rust 扩展，产物输出到 python/build_pip/）
+bash build_sglang_corex.sh
+
+# 2. 安装：先装 requirements/ilu.txt 引导轮子 + pyproject 依赖（均 --no-deps），再装 sglang wheel
+bash install_sglang_corex.sh
+
+# 3. 启动服务（以 Qwen3-30B-A3B + PP4 为例）
+SGLANG_USE_IXFORMER=1 python -m sglang.launch_server \
+  --model-path /path/to/Qwen3-30B-A3B \
+  --attention-backend ixformer \
+  --pp-size 4 \
+  --disable-cuda-graph --disable-piecewise-cuda-graph --disable-radix-cache
+```
+
+选择 `--attention-backend ixformer` 时会自动设置 `SGLANG_USE_IXFORMER=1` 并将 `page_size` 固定为 16。
+
+--------------------------------------------------------------------------------
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 

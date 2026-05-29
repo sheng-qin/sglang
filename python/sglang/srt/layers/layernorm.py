@@ -25,6 +25,7 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.ixformer_utils import use_ixformer
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -80,12 +81,26 @@ if _is_cuda or _is_xpu or _is_musa:
     else:
         _flashinfer_layernorm_available = False
 
-    from sgl_kernel import (
-        fused_add_rmsnorm,
-        gemma_fused_add_rmsnorm,
-        gemma_rmsnorm,
-        rmsnorm,
-    )
+    try:
+        from sgl_kernel import (
+            fused_add_rmsnorm,
+            gemma_fused_add_rmsnorm,
+            gemma_rmsnorm,
+            rmsnorm,
+        )
+    except ImportError:
+        from ixformer.inference.functions import gemma_rms_norm as gemma_rmsnorm
+        from ixformer.inference.functions import rms_norm as rmsnorm
+        from ixformer.inference.functions import residual_rms_norm as _ixf_residual_rms_norm
+
+        def fused_add_rmsnorm(x, residual, weight, eps):
+            out, residual_out = _ixf_residual_rms_norm(
+                x, weight, eps, residual=residual, output=x, residual_output=residual
+            )
+            x.copy_(out)
+            residual.copy_(residual_out)
+
+        gemma_fused_add_rmsnorm = fused_add_rmsnorm
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 if _use_aiter:
@@ -266,6 +281,25 @@ class RMSNorm(MultiPlatformOp):
             else:
                 # Fallback: pure-Python HF semantics (already implemented in forward_native).
                 out = self.forward_native(x, None, None)
+            if needs_reshape:
+                out = out.reshape(original_shape)
+            return out
+        if use_ixformer():
+            import ixformer.inference.functions as ixf
+
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                out, residual_out = ixf.residual_rms_norm(
+                    x,
+                    self.weight.data,
+                    self.variance_epsilon,
+                    residual=residual,
+                )
+                if needs_reshape:
+                    out = out.reshape(original_shape)
+                return out, residual_out
+            out = ixf.rms_norm(x, self.weight.data, self.variance_epsilon)
             if needs_reshape:
                 out = out.reshape(original_shape)
             return out

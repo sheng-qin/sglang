@@ -26,6 +26,7 @@ import triton.language as tl
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.srt.environ import envs
+from sglang.srt.layers.ixformer_utils import use_ixformer
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -450,6 +451,7 @@ def apply_qk_norm(
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
         and get_global_server_args().piecewise_cuda_graph_compiler
         != "inductor"  # let inductor fuse QK norm
+        and not use_ixformer()
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(

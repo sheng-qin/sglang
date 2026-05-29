@@ -1261,7 +1261,7 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
             )
-        if _is_cuda:
+        if _is_cuda and server_args.attention_backend != "ixformer":
             assert_pkg_version(
                 "sglang-kernel",
                 "0.4.3",

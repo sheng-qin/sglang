@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.ixformer_utils import use_ixformer
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
@@ -98,7 +99,12 @@ class SiluAndMul(MultiPlatformOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
+        if use_ixformer():
+            import ixformer.inference.functions as ixf
+
+            ixf.silu_and_mul(x, out)
+        else:
+            silu_and_mul(x, out)
         return out
 
     def forward_aiter(self, x: torch.Tensor, limit: float = 0.0) -> torch.Tensor:
@@ -163,6 +169,19 @@ class GeluAndMul(MultiPlatformOp):
             return self.forward_native(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if use_ixformer():
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            import ixformer.inference.functions as ixf
+
+            if self.approximate == "tanh":
+                ixf.gelu_tanh_and_mul(x, out)
+            elif self.approximate == "none":
+                ixf.gelu_and_mul(x, out)
+            else:
+                raise RuntimeError("GeluAndMul only support tanh or none")
+            return out
         return self._forward_impl(x)
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:

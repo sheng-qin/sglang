@@ -46,6 +46,7 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
     quantize_k_cache_separate,
 )
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.ixformer_utils import use_ixformer
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
@@ -909,24 +910,43 @@ class MHATokenToKVPool(KVCache):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.v_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                if use_ixformer():
+                    num_pages = (self.size + self.page_size) // self.page_size
+                    self.k_buffer = [
+                        torch.zeros(
+                            (num_pages, self.head_num, self.page_size, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (num_pages, self.head_num, self.page_size, self.v_head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                else:
+                    # [size, head_num, head_dim] for each layer. The padded slot
+                    # 0 is used for writing dummy outputs from padded tokens.
+                    self.k_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.v_head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -1077,6 +1097,21 @@ class MHATokenToKVPool(KVCache):
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
+
+        if use_ixformer() and self.same_kv_dim:
+            import ixformer.inference.functions as ixf
+
+            ixf.reshape_and_cache_flash(
+                cache_k.view(-1, self.head_num, self.head_dim),
+                cache_v.view(-1, self.head_num, self.v_head_dim),
+                self.k_buffer[layer_id - self.start_layer],
+                self.v_buffer[layer_id - self.start_layer],
+                loc,
+                "auto",
+                1.0,
+                1.0,
+            )
+            return
 
         _set_kv_buffer_impl(
             cache_k,

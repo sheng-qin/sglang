@@ -6,12 +6,21 @@ import traceback
 from contextlib import nullcontext
 
 import torch
-from torch.cuda.memory import (
-    CUDAPluggableAllocator,
-    _cuda_beginAllocateCurrentThreadToPool,
-    _cuda_endAllocateToPool,
-    _cuda_releasePool,
-)
+try:
+    from torch.cuda.memory import (
+        CUDAPluggableAllocator,
+        _cuda_beginAllocateCurrentThreadToPool,
+        _cuda_endAllocateToPool,
+        _cuda_releasePool,
+    )
+
+    _SYMMETRIC_MEMORY_AVAILABLE = True
+except ImportError:
+    CUDAPluggableAllocator = None
+    _cuda_beginAllocateCurrentThreadToPool = None
+    _cuda_endAllocateToPool = None
+    _cuda_releasePool = None
+    _SYMMETRIC_MEMORY_AVAILABLE = False
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
@@ -158,6 +167,8 @@ _register_func = None
 
 
 def is_symmetric_memory_enabled():
+    if not _SYMMETRIC_MEMORY_AVAILABLE:
+        return False
     try:
         return get_global_server_args().enable_symm_mem
     except ValueError:
@@ -324,6 +335,8 @@ class SymmetricMemoryContext:
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
     disabled = (
+        not _SYMMETRIC_MEMORY_AVAILABLE
+        or
         not is_symmetric_memory_enabled()
         or disabled
         or group_coordinator.world_size == 1

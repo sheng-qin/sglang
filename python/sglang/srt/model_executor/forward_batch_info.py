@@ -49,6 +49,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.ixformer_utils import use_ixformer
 from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
@@ -1248,7 +1249,7 @@ def _clamp_position_native(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 
-if is_cuda() or is_hip():
+if (is_cuda() or is_hip()) and not use_ixformer():
     from sglang.jit_kernel.clamp_position import clamp_position_cuda
 
     clamp_position = clamp_position_cuda

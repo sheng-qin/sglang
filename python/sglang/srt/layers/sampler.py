@@ -25,10 +25,19 @@ from sglang.srt.utils.common import (
 )
 
 if is_cuda():
-    from flashinfer.sampling import (
-        min_p_sampling_from_probs,
-        top_k_top_p_sampling_from_probs,
-    )
+    try:
+        from flashinfer.sampling import (
+            min_p_sampling_from_probs,
+            top_k_top_p_sampling_from_probs,
+        )
+    except ImportError:
+
+        def min_p_sampling_from_probs(*args, **kwargs):
+            raise ImportError("flashinfer is required for flashinfer sampling backend")
+
+        def top_k_top_p_sampling_from_probs(*args, **kwargs):
+            raise ImportError("flashinfer is required for flashinfer sampling backend")
+
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,

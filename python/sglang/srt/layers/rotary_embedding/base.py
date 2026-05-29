@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+from sglang.srt.layers.ixformer_utils import use_ixformer
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -340,6 +341,9 @@ class RotaryEmbedding(MultiPlatformOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if use_ixformer() and fused_set_kv_buffer_arg is None:
+            return self.forward_native(positions, query, key, offsets)
+
         if not self.use_fallback_kernel:
             batch_size = positions.size(0)
             q_rope = query.view(batch_size, -1, self.head_size)

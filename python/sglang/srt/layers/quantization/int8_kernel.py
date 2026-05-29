@@ -18,8 +18,10 @@ if _is_cuda:
 
         enable_sgl_per_token_group_quant_8bit = True
     except ImportError:
-        from sgl_kernel import sgl_per_token_group_quant_int8
-
+        try:
+            from sgl_kernel import sgl_per_token_group_quant_int8
+        except ImportError:
+            sgl_per_token_group_quant_int8 = None
         enable_sgl_per_token_group_quant_8bit = False
 
 logger = logging.getLogger(__name__)
@@ -219,6 +221,8 @@ def sglang_per_token_group_quant_int8(
             x, x_q, x_s, group_size, eps, int8_min, int8_max, enable_v2=enable_v2
         )
     else:
+        if sgl_per_token_group_quant_int8 is None:
+            raise ImportError("sgl_kernel is required for CUDA int8 group quantization")
         assert not enable_v2
         sgl_per_token_group_quant_int8(x, x_q, x_s, group_size, eps, int8_min, int8_max)
 

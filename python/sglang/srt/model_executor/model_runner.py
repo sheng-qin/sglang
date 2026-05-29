@@ -260,6 +260,7 @@ MLA_ATTENTION_BACKENDS = [
 ]
 
 CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
+    "ixformer",
     "flashinfer",
     "fa3",
     "fa4",
@@ -1229,7 +1230,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
             torch.set_num_threads(1)
-        if self.device == "cuda":
+        if self.device == "cuda" and self.server_args.attention_backend != "ixformer":
             if torch.cuda.get_device_capability()[0] < 8:
                 logger.info(
                     "Compute capability below sm80. Use float16 due to lack of bfloat16 support."

@@ -148,6 +148,15 @@ def create_triton_backend(runner):
     return TritonAttnBackend(runner)
 
 
+@register_attention_backend("ixformer")
+def create_ixformer_backend(runner):
+    if runner.use_mla_backend:
+        raise ValueError("ixformer backend currently supports non-MLA models only.")
+    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+
+    return FlashAttentionBackend(runner, kernel_provider="ixformer")
+
+
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend

@@ -98,6 +98,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.utils import is_deepep_class_backend
+from sglang.srt.layers.ixformer_utils import use_ixformer
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
@@ -129,7 +130,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
 if _is_cuda:
-    from sgl_kernel import moe_fused_gate
+    try:
+        from sgl_kernel import moe_fused_gate
+    except ImportError:
+        moe_fused_gate = None
 
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
@@ -172,7 +176,10 @@ if _is_cuda:
         pass
 
 if _is_cuda or _is_hip or _is_xpu:
-    from sgl_kernel import topk_softmax
+    try:
+        from sgl_kernel import topk_softmax
+    except ImportError:
+        topk_softmax = None
 
     try:
         from sgl_kernel import topk_sigmoid
@@ -676,12 +683,23 @@ def fused_topk(
                 topk_weights=topk_weights,
             )
         else:
-            topk_softmax(
-                topk_weights,
-                topk_ids,
-                gating_output,
-                renormalize,
-            )
+            if use_ixformer():
+                import ixformer.inference.functions as ixf
+
+                ixf.moe_topk_softmax(
+                    gating_output.float(),
+                    topk,
+                    topk_weight=topk_weights,
+                    topk_ids=topk_ids,
+                    renormalize=renormalize,
+                )
+            else:
+                topk_softmax(
+                    topk_weights,
+                    topk_ids,
+                    gating_output,
+                    renormalize,
+                )
     elif scoring_func == "sigmoid":
         if _use_aiter and correction_bias is not None:
             aiter_biased_grouped_topk(
@@ -1563,7 +1581,7 @@ def select_experts(
 # Register fake implementations for torch.compile support
 if _is_cuda:
 
-    @torch.library.register_fake("sgl_kernel::moe_fused_gate")
+    @register_fake_if_exists("sgl_kernel::moe_fused_gate")
     def _moe_fused_gate(
         input_tensor,
         bias,

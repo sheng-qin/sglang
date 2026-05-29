@@ -47,6 +47,7 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.ixformer_utils import use_ixformer
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -92,10 +93,16 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.jit_kernel.fused_qknorm_rope import (
-        can_use_fused_qk_norm_rope,
-        fused_qk_norm_rope,
-    )
+    try:
+        from sglang.jit_kernel.fused_qknorm_rope import (
+            can_use_fused_qk_norm_rope,
+            fused_qk_norm_rope,
+        )
+    except ImportError:
+        fused_qk_norm_rope = None
+
+        def can_use_fused_qk_norm_rope(*args, **kwargs):
+            return False
 
 TConfig = TypeVar("TConfig", bound=PretrainedConfig)
 
@@ -529,6 +536,7 @@ class Qwen3MoeAttention(nn.Module):
             get_global_server_args().enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
             and _is_cuda
+            and not use_ixformer()
             and can_use_fused_qk_norm_rope(
                 self.head_dim,
                 self.rotary_emb.is_neox_style,
@@ -651,6 +659,7 @@ class Qwen3MoeAttention(nn.Module):
                         forward_batch=forward_batch,
                     )
                     if enable_fused_set_kv_buffer(forward_batch)
+                    and not use_ixformer()
                     and self.compatible_with_fused_kv_buffer
                     else None
                 ),
@@ -692,6 +701,7 @@ class Qwen3MoeAttention(nn.Module):
         must_save_kv = self._used_fused_qk_norm_rope_last_call
         save_kv_cache = must_save_kv or not (
             enable_fused_set_kv_buffer(forward_batch)
+            and not use_ixformer()
             and self.compatible_with_fused_kv_buffer
         )
         attn_output = self.attn(

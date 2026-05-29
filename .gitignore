@@ -9,6 +9,8 @@ __pycache__/
 # Distribution / packaging
 .Python
 **/build/
+# CoreX wheel build output (build_sglang_corex.sh)
+**/build_pip/
 **/develop-eggs/
 **/dist/
 **/downloads/

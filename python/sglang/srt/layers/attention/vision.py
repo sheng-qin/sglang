@@ -43,11 +43,19 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 if _is_cuda:
-    from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
+    try:
+        from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
+    except ImportError:
 
-    from sglang.jit_kernel.flash_attention import (
-        flash_attn_varlen_func,
-    )
+        def cudnn_batch_prefill_with_kv_cache(*args, **kwargs):
+            raise ImportError("flashinfer is required for cuDNN vision attention")
+
+    try:
+        from sglang.jit_kernel.flash_attention import (
+            flash_attn_varlen_func,
+        )
+    except ImportError:
+        from ixformer.contrib.vllm_flash_attn import flash_attn_varlen_func
 
 if _is_cpu and _is_cpu_amx_available:
     flash_attn_varlen_func = torch.ops.sgl_kernel.flash_attn_varlen_func

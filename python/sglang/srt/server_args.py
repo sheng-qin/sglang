@@ -155,6 +155,7 @@ ATTENTION_BACKEND_CHOICES = [
     "triton",
     "torch_native",
     "flex_attention",
+    "ixformer",
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
     "dsv4",
@@ -2752,6 +2753,27 @@ class ServerArgs:
             assert (
                 self.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
+
+        if (
+            self.attention_backend == "ixformer"
+            or self.prefill_attention_backend == "ixformer"
+            or self.decode_attention_backend == "ixformer"
+        ):
+            os.environ.setdefault("SGLANG_USE_IXFORMER", "1")
+            logger.warning(
+                "Cuda graph is disabled for the initial ixformer backend bring-up."
+            )
+            self.disable_cuda_graph = True
+            # The ixformer paged-attention kernel (cuInfer vllm_paged_attention)
+            # only supports a KV page size of 16. Force it so decode can use the
+            # native paged attention path instead of a torch fallback.
+            if self.page_size != 16:
+                if self.page_size not in (None, 1):
+                    logger.warning(
+                        "ixformer backend requires page_size=16; overriding "
+                        f"the requested page_size={self.page_size}."
+                    )
+                self.page_size = 16
 
         # Whisper's encoder token padding conflicts with prefix caching.
         # Only disable for Whisper; other encoder-decoder models (e.g., mllama) use radix cache.

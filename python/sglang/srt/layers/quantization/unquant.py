@@ -28,6 +28,7 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.ixformer_utils import use_ixformer
 from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -101,6 +102,10 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if use_ixformer() and x.is_cuda:
+            import ixformer.inference.functions as ixf
+
+            return ixf.linear(x, layer.weight, bias)
         return F.linear(x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
@@ -158,6 +163,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
+
+        if use_ixformer() and x.is_cuda:
+            import ixformer.inference.functions as ixf
+
+            return ixf.linear(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
 
@@ -438,6 +448,50 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         x = dispatch_output.hidden_states
 
         moe_runner_config = self.moe_runner_config
+
+        if use_ixformer() and x.is_cuda:
+            # Correctness-first per-expert path for the ixformer backend. It is
+            # functionally correct but iterates experts in Python; replacing it
+            # with the fused ixformer group-GEMM MoE kernels is a follow-up
+            # performance optimization.
+            assert moe_runner_config.activation == "silu", (
+                f"activation = {moe_runner_config.activation} is not supported by "
+                "the ixformer unquantized MoE path."
+            )
+            if moe_runner_config.apply_router_weight_on_input or self.with_bias:
+                raise NotImplementedError(
+                    "ixformer unquantized MoE path does not support router-weight-on-input or bias yet."
+                )
+            topk_output = dispatch_output.topk_output
+            topk_weights, topk_ids, _ = topk_output
+            output = torch.zeros_like(x)
+            intermediate_size = layer.w2_weight.shape[-1]
+            scaling_factor = (
+                moe_runner_config.routed_scaling_factor
+                if moe_runner_config.routed_scaling_factor is not None
+                else 1.0
+            )
+            for expert_id in range(layer.num_experts):
+                token_ids, slot_ids = torch.where(topk_ids == expert_id)
+                if token_ids.numel() == 0:
+                    continue
+                gate_up = torch.nn.functional.linear(
+                    x[token_ids], layer.w13_weight[expert_id]
+                )
+                hidden = (
+                    torch.nn.functional.silu(gate_up[:, :intermediate_size])
+                    * gate_up[:, intermediate_size:]
+                )
+                expert_out = torch.nn.functional.linear(
+                    hidden, layer.w2_weight[expert_id]
+                )
+                expert_out = expert_out * topk_weights[token_ids, slot_ids].to(
+                    expert_out.dtype
+                ).unsqueeze(-1)
+                output.index_add_(0, token_ids, expert_out)
+            if scaling_factor != 1.0:
+                output.mul_(scaling_factor)
+            return StandardCombineInput(hidden_states=output)
 
         backend = self.runner.runner_backend
         if backend.is_triton_kernels():

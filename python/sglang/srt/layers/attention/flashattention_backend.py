@@ -25,12 +25,92 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sgl_kernel import merge_state_v2
+try:
+    from sgl_kernel import merge_state_v2
+except ImportError:
+    merge_state_v2 = None
 
-from sglang.jit_kernel.flash_attention import (
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
-)
+try:
+    from sglang.jit_kernel.flash_attention import (
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+    )
+except ImportError:
+    flash_attn_varlen_func = None
+    flash_attn_with_kvcache = None
+
+
+def _wrap_ixformer_varlen_func(fn):
+    def wrapped(*args, **kwargs):
+        kwargs.pop("num_splits", None)
+        kwargs.pop("ver", None)
+        return fn(*args, **kwargs)
+
+    return wrapped
+
+
+def _wrap_ixformer_kvcache_func(fn):
+    def wrapped(*args, **kwargs):
+        q = kwargs.get("q", args[0] if args else None)
+        if "page_table" in kwargs:
+            kwargs["block_table"] = kwargs.pop("page_table")
+        if kwargs.get("max_context_len") is None and kwargs.get("block_table") is not None:
+            kwargs["max_context_len"] = kwargs["block_table"].shape[-1]
+        if "cu_seqlens_q" in kwargs:
+            kwargs["cu_query_lens"] = kwargs.pop("cu_seqlens_q")
+        if "max_seqlen_q" in kwargs:
+            kwargs["max_query_len"] = kwargs.pop("max_seqlen_q")
+
+        # These arguments are FA3/FA4-specific. The ixformer wrapper exposes the
+        # vLLM flash-attn API and derives the same information from cache lengths
+        # and query metadata.
+        for name in (
+            "cu_seqlens_k_new",
+            "k_descale",
+            "v_descale",
+            "ver",
+            "scheduler_metadata",
+        ):
+            kwargs.pop(name, None)
+
+        cu_query_lens = kwargs.get("cu_query_lens")
+        out = kwargs.get("out")
+        if q is not None and q.dim() == 3 and cu_query_lens is not None:
+            max_query_len = int(kwargs.get("max_query_len") or 1)
+            batch_size = cu_query_lens.numel() - 1
+            padded_q = q.new_zeros(
+                (batch_size, max_query_len, q.shape[-2], q.shape[-1])
+            )
+            for i in range(batch_size):
+                start = int(cu_query_lens[i].item())
+                end = int(cu_query_lens[i + 1].item())
+                padded_q[i, : end - start] = q[start:end]
+            kwargs["q"] = padded_q
+            kwargs["out"] = None
+            result = fn(*args, **kwargs)
+
+            def _flatten_valid(tensor):
+                pieces = []
+                for i in range(batch_size):
+                    start = int(cu_query_lens[i].item())
+                    end = int(cu_query_lens[i + 1].item())
+                    pieces.append(tensor[i, : end - start])
+                return torch.cat(pieces, dim=0)
+
+            if isinstance(result, tuple):
+                flat = _flatten_valid(result[0])
+                result = (flat, *result[1:])
+            else:
+                flat = _flatten_valid(result)
+                if out is not None:
+                    out.copy_(flat)
+                    return out
+                result = flat
+            return result
+
+        return fn(*args, **kwargs)
+
+    return wrapped
 
 
 @dataclass
@@ -110,6 +190,7 @@ class FlashAttentionBackend(AttentionBackend):
         topk=0,
         speculative_num_steps=0,
         fa_impl_ver=3,
+        kernel_provider: str = "sgl",
     ):
         super().__init__()
 
@@ -165,9 +246,27 @@ class FlashAttentionBackend(AttentionBackend):
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
 
+        self.kernel_provider = kernel_provider
+
         # Select version
         self.fa_impl_ver = fa_impl_ver
-        if self.fa_impl_ver == 3:
+        if self.kernel_provider == "ixformer":
+            import ixformer.inference.functions as ixf
+            from ixformer.contrib.vllm_flash_attn import (
+                flash_attn_varlen_func as ixf_flash_attn_varlen_func,
+                flash_attn_with_kvcache as ixf_flash_attn_with_kvcache,
+            )
+
+            global flash_attn_varlen_func, flash_attn_with_kvcache, merge_state_v2
+            flash_attn_varlen_func = _wrap_ixformer_varlen_func(
+                ixf_flash_attn_varlen_func
+            )
+            flash_attn_with_kvcache = _wrap_ixformer_kvcache_func(
+                ixf_flash_attn_with_kvcache
+            )
+            merge_state_v2 = getattr(ixf, "merge_state_v2", None)
+            self._get_scheduler_metadata = None
+        elif self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
                 flash_attn_varlen_func,
                 flash_attn_with_kvcache,
@@ -785,12 +884,20 @@ class FlashAttentionBackend(AttentionBackend):
             # Do multi-head attention
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-            )
+            if self.kernel_provider == "ixformer":
+                key_cache = key_cache.view(
+                    -1, layer.tp_k_head_num, self.page_size, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, layer.tp_v_head_num, self.page_size, layer.v_head_dim
+                )
+            else:
+                key_cache = key_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
@@ -856,6 +963,30 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size=window_size,
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
+                    out=_fa_out,
+                    **kwargs,
+                )
+            elif (
+                self.kernel_provider == "ixformer"
+                and k is not None
+                and not use_local_attn
+                and not use_cascade_attn
+            ):
+                # Ixformer's paged attention path is decode-oriented. For plain
+                # prefill with no prefix-cache span, use raw varlen attention and
+                # keep the KV cache write performed above.
+                result = flash_attn_varlen_func(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                    v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
                     out=_fa_out,
                     **kwargs,
                 )
@@ -1195,12 +1326,20 @@ class FlashAttentionBackend(AttentionBackend):
             # Do multi-head attention
 
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-            )
+            if self.kernel_provider == "ixformer":
+                key_cache = key_cache.view(
+                    -1, layer.tp_k_head_num, self.page_size, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, layer.tp_v_head_num, self.page_size, layer.v_head_dim
+                )
+            else:
+                key_cache = key_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
@@ -1272,27 +1411,59 @@ class FlashAttentionBackend(AttentionBackend):
                     and not use_cascade_attn
                 ):
                     sched_meta = metadata.scheduler_metadata
-                result = flash_attn_with_kvcache(
-                    q=q_reshaped,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
-                    out=_fa_out,
-                    ver=self.fa_impl_ver,
-                    scheduler_metadata=sched_meta,
-                    **kwargs,
-                )
+                if (
+                    self.kernel_provider == "ixformer"
+                    and max_seqlen_q == 1
+                    and not use_cascade_attn
+                    and not is_swa_layer
+                ):
+                    # Native ixformer paged attention (cuInfer). The kernel
+                    # requires a paged KV layout with page_size in
+                    # {16, 32, 64, 128}; page_size == 1 is not supported.
+                    # key_cache/value_cache were viewed above as
+                    # (num_blocks, nheads_k, page_size, head_dim) which is the
+                    # layout the ixformer kernel expects.
+                    from ixformer.contrib.vllm_flash_attn import (
+                        flash_attn_with_kvcache as ixf_flash_attn_with_kvcache,
+                    )
+
+                    result = ixf_flash_attn_with_kvcache(
+                        q=q_reshaped.unsqueeze(1),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        block_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        max_context_len=int(metadata.max_seq_len_k),
+                        softmax_scale=layer.scaling,
+                        causal=causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                    ).squeeze(1)
+                    if _fa_out is not None:
+                        _fa_out.copy_(result)
+                        result = _fa_out
+                else:
+                    result = flash_attn_with_kvcache(
+                        q=q_reshaped,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        return_softmax_lse=use_cascade_attn,
+                        num_splits=self.num_splits,
+                        out=_fa_out,
+                        ver=self.fa_impl_ver,
+                        scheduler_metadata=sched_meta,
+                        **kwargs,
+                    )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
