@@ -11,14 +11,14 @@
   - decode 用 ixformer 原生 paged attention `flash_attn_with_kvcache`（cuInfer）；
   - KV 写入用 `reshape_and_cache_flash`。
 - **关键算子替换**：RMSNorm、SiLU/GeLU-and-mul、Linear、MoE top-k softmax 切到 ixformer；RoPE / QK-Norm 在 ixformer 下走 PyTorch native（fused QK-Norm-RoPE 与 fused KV-write 关闭，由 attention 负责写 cache —— 否则 decode 会读到空 KV）。
-- **MoE**：当前为 per-expert 的 torch 正确性实现；融合版 ixformer group-GEMM MoE 为后续性能优化项。
+- **MoE**：使用融合的 ixformer group-GEMM（`moe_compute_token_index` / `moe_expand_input` / `moe_w16a16_group_gemm` / `silu_and_mul` / `moe_output_reduce_sum`）；per-expert torch 实现保留在 `SGLANG_IXFORMER_MOE_TORCH=1` 开关后，用于对拍/回退。
 - **依赖与构建**：`torch` / `triton` / `flashinfer` / `sgl-kernel` 等使用平台私有版，`python/pyproject.toml` 注释掉对应 CUDA 依赖；`sgl_kernel` 通过 shim 转发到 `ixformer.contrib.sgl_kernel`；CUDA C++ JIT 类 kernel（如 `clamp_position`、`fused_inplace_qknorm`）在 ixformer 下走 native 回退。
 - **CUDA graph**：bring-up 阶段默认关闭（`--disable-cuda-graph`）。
 
 ## 后续 TODO
 
 - **去掉 `python/sgl_kernel/` shim（路径 A）**：当前用顶层 `sgl_kernel` shim 转发到 `ixformer.contrib.sgl_kernel`，以减小对上游源码的改动。理想方案是由平台侧提供顶层 `sgl_kernel`（ixformer 直接 alias `ixformer.contrib.sgl_kernel` 为 `sgl_kernel`，或发布 CoreX 版 `sgl_kernel` wheel），届时 `import sgl_kernel` 原生可用，本目录即可删除。
-- **MoE 性能**：将 per-expert torch 实现替换为融合的 ixformer group-GEMM MoE。
+- ~~**MoE 性能**：将 per-expert torch 实现替换为融合的 ixformer group-GEMM MoE。~~（已完成）
 - **CUDA graph**：bring-up 稳定后尝试开启以提升 decode 吞吐。
 
 ## Iluvatar 平台编译与安装

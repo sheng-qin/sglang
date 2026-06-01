@@ -450,47 +450,98 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         moe_runner_config = self.moe_runner_config
 
         if use_ixformer() and x.is_cuda:
-            # Correctness-first per-expert path for the ixformer backend. It is
-            # functionally correct but iterates experts in Python; replacing it
-            # with the fused ixformer group-GEMM MoE kernels is a follow-up
-            # performance optimization.
+            import ixformer.inference.functions as ixf
+
             assert moe_runner_config.activation == "silu", (
                 f"activation = {moe_runner_config.activation} is not supported by "
                 "the ixformer unquantized MoE path."
             )
             if moe_runner_config.apply_router_weight_on_input or self.with_bias:
                 raise NotImplementedError(
-                    "ixformer unquantized MoE path does not support router-weight-on-input or bias yet."
+                    "ixformer unquantized MoE path does not support "
+                    "router-weight-on-input or bias yet."
                 )
-            topk_output = dispatch_output.topk_output
-            topk_weights, topk_ids, _ = topk_output
-            output = torch.zeros_like(x)
-            intermediate_size = layer.w2_weight.shape[-1]
+
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            num_tokens = x.shape[0]
+            top_k = topk_ids.shape[1]
             scaling_factor = (
                 moe_runner_config.routed_scaling_factor
                 if moe_runner_config.routed_scaling_factor is not None
                 else 1.0
             )
-            for expert_id in range(layer.num_experts):
-                token_ids, slot_ids = torch.where(topk_ids == expert_id)
-                if token_ids.numel() == 0:
-                    continue
-                gate_up = torch.nn.functional.linear(
-                    x[token_ids], layer.w13_weight[expert_id]
-                )
-                hidden = (
-                    torch.nn.functional.silu(gate_up[:, :intermediate_size])
-                    * gate_up[:, intermediate_size:]
-                )
-                expert_out = torch.nn.functional.linear(
-                    hidden, layer.w2_weight[expert_id]
-                )
-                expert_out = expert_out * topk_weights[token_ids, slot_ids].to(
-                    expert_out.dtype
-                ).unsqueeze(-1)
-                output.index_add_(0, token_ids, expert_out)
-            if scaling_factor != 1.0:
-                output.mul_(scaling_factor)
+
+            if get_bool_env_var("SGLANG_IXFORMER_MOE_TORCH"):
+                # Per-expert torch reference path (slow). Kept behind an env flag
+                # for A/B correctness checks and as a fallback if a fused-kernel
+                # issue surfaces.
+                output = torch.zeros_like(x)
+                intermediate_size = layer.w2_weight.shape[-1]
+                for expert_id in range(layer.num_experts):
+                    token_ids, slot_ids = torch.where(topk_ids == expert_id)
+                    if token_ids.numel() == 0:
+                        continue
+                    gate_up = torch.nn.functional.linear(
+                        x[token_ids], layer.w13_weight[expert_id]
+                    )
+                    hidden = (
+                        torch.nn.functional.silu(gate_up[:, :intermediate_size])
+                        * gate_up[:, intermediate_size:]
+                    )
+                    expert_out = torch.nn.functional.linear(
+                        hidden, layer.w2_weight[expert_id]
+                    )
+                    expert_out = expert_out * topk_weights[token_ids, slot_ids].to(
+                        expert_out.dtype
+                    ).unsqueeze(-1)
+                    output.index_add_(0, token_ids, expert_out)
+                if scaling_factor != 1.0:
+                    output.mul_(scaling_factor)
+                return StandardCombineInput(hidden_states=output)
+
+            # Native fused ixformer group-GEMM MoE. SGLang weight layouts match
+            # the "TN" format directly: w13_weight is (E, 2*intermediate, hidden)
+            # and w2_weight is (E, hidden, intermediate), i.e. (E, n, k).
+            expand_tokens = num_tokens * top_k
+            (
+                src_to_dst,
+                sorted_token_ids,
+                expert_sizes_gpu,
+                _expert_sizes_cpu,
+            ) = ixf.moe_compute_token_index(
+                topk_ids=topk_ids.to(torch.int32),
+                num_experts=layer.num_experts,
+            )
+            tokens_per_experts = expert_sizes_gpu.cpu()
+
+            expand_hidden_states = ixf.moe_expand_input(
+                hidden_states=x,
+                dst_to_src=sorted_token_ids,
+                dst_tokens=expand_tokens,
+                topk=top_k,
+                src_to_dst=src_to_dst,
+            )
+            gate_up = ixf.moe_w16a16_group_gemm(
+                input=expand_hidden_states,
+                weight=layer.w13_weight,
+                output_dtype=x.dtype,
+                tokens_per_experts=tokens_per_experts,
+                format="TN",
+            )
+            activated = ixf.silu_and_mul(gate_up)
+            down = ixf.moe_w16a16_group_gemm(
+                input=activated,
+                weight=layer.w2_weight,
+                output_dtype=x.dtype,
+                tokens_per_experts=tokens_per_experts,
+                dst_to_src=sorted_token_ids,
+                format="TN",
+            )
+            output = ixf.moe_output_reduce_sum(
+                input=down.view(num_tokens, top_k, -1),
+                topk_weight=topk_weights,
+                scaling_factor=scaling_factor,
+            )
             return StandardCombineInput(hidden_states=output)
 
         backend = self.runner.runner_backend
