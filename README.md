@@ -4,6 +4,7 @@
 
 - **Qwen3-30B-A3B**（bf16 MoE，PP4）
 - **Qwen3-8B-W8A8**（compressed-tensors W8A8 int8，dense，PP4）
+- **Qwen3-30B-A3B-Instruct-2507-W8A8**（compressed-tensors W8A8 int8，MoE，PP4）
 
 上述模型 prefill / decode 输出均已验证正确。
 
@@ -17,7 +18,10 @@
   - KV 写入用 `reshape_and_cache_flash`。
 - **关键算子替换**：RMSNorm、SiLU/GeLU-and-mul、Linear、MoE top-k softmax 切到 ixformer；RoPE / QK-Norm 在 ixformer 下走 PyTorch native（fused QK-Norm-RoPE 与 fused KV-write 关闭，由 attention 负责写 cache —— 否则 decode 会读到空 KV）。
 - **MoE**：使用融合的 ixformer group-GEMM（`moe_compute_token_index` / `moe_expand_input` / `moe_w16a16_group_gemm` / `silu_and_mul` / `moe_output_reduce_sum`）；per-expert torch 实现保留在 `SGLANG_IXFORMER_MOE_TORCH=1` 开关后，用于对拍/回退。
-- **W8A8 量化（compressed-tensors int8）**：`CompressedTensorsW8A8Int8.apply_weights` 走 ixformer —— 激活用 `ixf.scaled_int8_quant` 做动态 per-token int8 量化，GEMM 用 `ixf.w8a8(format="TN")`（`layer.weight` 存为 `[K,N]`，`.t()` 得到 ixformer TN 需要的 `[N,K]`）。量化方案的最小算力检查（`_check_scheme_supported`，Ampere sm80）在 ixformer 下跳过（Iluvatar 报 sm71，但量化走 ixformer 算子）。KV cache 不量化（`kv_cache_scheme: null`），注意力仍走 bf16 paged 路径。
+- **W8A8 量化（compressed-tensors int8）**：
+  - 稠密线性层：`CompressedTensorsW8A8Int8.apply_weights` 走 ixformer —— 激活用 `ixf.scaled_int8_quant` 做动态 per-token int8 量化，GEMM 用 `ixf.w8a8(format="TN")`（`layer.weight` 存为 `[K,N]`，`.t()` 得到 ixformer TN 需要的 `[N,K]`）。
+  - MoE 专家：新增 `IxformerCompressedTensorsW8A8Int8DynamicMoE`（`get_moe_scheme` 在 ixformer 下返回它，代替上游的 NPU-only `NotImplementedError`），走 ixformer int8 group-GEMM —— `moe_compute_token_index` → `moe_expand_input_dynamic_scaled_int8` → `moe_w8a8_group_gemm`(w13) → `activation_dynamic_scaled_int8`(swiglu) → `moe_w8a8_group_gemm`(w2) → `moe_output_reduce_sum`。
+  - 量化方案的最小算力检查（`_check_scheme_supported`，Ampere sm80）在 ixformer 下跳过（Iluvatar 报 sm71，但量化走 ixformer 算子）。KV cache 不量化（`kv_cache_scheme: null`），注意力仍走 bf16 paged 路径。
 - **依赖与构建**：`torch` / `triton` / `flashinfer` / `sgl-kernel` 等使用平台私有版，`python/pyproject.toml` 注释掉对应 CUDA 依赖；`sgl_kernel` 通过 shim 转发到 `ixformer.contrib.sgl_kernel`；CUDA C++ JIT 类 kernel（如 `clamp_position`、`fused_inplace_qknorm`）在 ixformer 下走 native 回退。
 - **CUDA graph**：bring-up 阶段默认关闭（`--disable-cuda-graph`）。
 

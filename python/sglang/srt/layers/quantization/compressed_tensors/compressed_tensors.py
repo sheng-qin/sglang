@@ -51,6 +51,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
+    IxformerCompressedTensorsW8A8Int8DynamicMoE,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
@@ -715,9 +716,16 @@ class CompressedTensorsConfig(QuantizationConfig):
             logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
             return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
         elif self._is_dynamic_token_w8a8(weight_quant, input_quant):
+            from sglang.srt.layers.ixformer_utils import use_ixformer
+
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW8A8Int8DynamicMoE")
                 return NPUCompressedTensorsW8A8Int8DynamicMoE(weight_quant, input_quant)
+            elif use_ixformer():
+                logger.info_once("Using IxformerCompressedTensorsW8A8Int8DynamicMoE")
+                return IxformerCompressedTensorsW8A8Int8DynamicMoE(
+                    weight_quant, input_quant
+                )
             else:
                 raise NotImplementedError(
                     f"The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
