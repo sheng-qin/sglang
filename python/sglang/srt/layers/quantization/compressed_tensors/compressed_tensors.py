@@ -328,6 +328,14 @@ class CompressedTensorsConfig(QuantizationConfig):
         return []
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
+        # On Iluvatar/CoreX the device reports an sm_71-style capability but the
+        # int8/fp8 schemes run through ixformer kernels rather than the
+        # capability-gated NVIDIA kernels, so skip the Ampere+ gate.
+        from sglang.srt.layers.ixformer_utils import use_ixformer
+
+        if use_ixformer():
+            return True
+
         capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
 
         if capability_tuple is not None:

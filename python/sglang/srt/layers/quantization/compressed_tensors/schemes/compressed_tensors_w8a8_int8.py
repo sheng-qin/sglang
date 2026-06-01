@@ -19,6 +19,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
+from sglang.srt.layers.ixformer_utils import use_ixformer
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import is_cuda
@@ -27,7 +28,10 @@ __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sgl_kernel import int8_scaled_mm
+    try:
+        from sgl_kernel import int8_scaled_mm
+    except ImportError:
+        int8_scaled_mm = None
 
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
@@ -171,6 +175,26 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
     ) -> torch.Tensor:
+        if use_ixformer() and x.is_cuda:
+            import ixformer.inference.functions as ixf
+
+            # Dynamic per-token int8 activation quant + ixformer w8a8 GEMM.
+            # layer.weight is stored as [K, N] (channel path transposes the
+            # original [N, K]); ixformer "TN" wants weight (m=N, k=K), so
+            # layer.weight.t() gives the contiguous [N, K] it expects.
+            x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+            i8_x, x_scale = ixf.scaled_int8_quant(x_2d)
+            out = ixf.w8a8(
+                input=i8_x,
+                weight=layer.weight.t(),
+                i_scales=x_scale.view(-1),
+                w_scales=layer.weight_scale.view(-1),
+                bias=bias,
+                out_dtype=x.dtype,
+                format="TN",
+            )
+            return out.reshape(*x.shape[:-1], -1)
+
         # TODO: add cutlass_scaled_mm_azp support
         x_q, x_scale = per_token_quant_int8(x)
 
